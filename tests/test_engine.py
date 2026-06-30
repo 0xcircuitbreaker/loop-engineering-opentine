@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from loopforge import LoopEngine
 from loopforge.strategies import numeric_refinement
 from loopforge.recorder import LoopRecorder
