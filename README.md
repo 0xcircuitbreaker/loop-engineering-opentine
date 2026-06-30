@@ -105,3 +105,10 @@ Run:
 pytest -q
 ruff check src tests
 ```
+
+
+## Notes
+
+- Run CLI examples using a local install because `typer` is an optional dependency in this repo's core docs.
+- All generated `.tine` artifacts are written under `~/.local/share/loopforge` by default.
+
