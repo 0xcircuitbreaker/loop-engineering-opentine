@@ -59,7 +59,8 @@ loopforge compare left.tine right.tine
 ## Example: branchable numeric loop
 
 ```python
-from loopforge import LoopEngine, numeric_refinement
+from loopforge import LoopEngine
+from loopforge.strategies import numeric_refinement
 
 engine = LoopEngine(
     step_fn=numeric_refinement(target=42),
@@ -109,6 +110,51 @@ ruff check src tests
 
 ## Notes
 
-- Run CLI examples using a local install because `typer` is an optional dependency in this repo's core docs.
-- All generated `.tine` artifacts are written under `~/.local/share/loopforge` by default.
+. All generated `.tine` artifacts are written under `~/.local/share/loopforge` by default.
+
+
+
+## Policy and model-backed execution
+
+```python
+from loopforge import LoopEngine, LoopPolicy
+from loopforge.models import StaticModelAdapter, build_json_model_step
+from loopforge.engine import LoopStepContext
+
+policy = LoopPolicy(
+    max_steps=12,
+    max_total_cost=0.75,
+    min_score=0.95,
+    max_duration_seconds=30.0,
+)
+
+adapter = StaticModelAdapter(
+    text='{"observation":"ok","score":0.97,"stop":true,"next_states":[]}',
+    cost=0.01,
+)
+
+# Parse JSON responses shaped as {observation, score, stop, next_states, metadata}
+def prompt_fn(ctx: LoopStepContext) -> str:
+    return f"[{ctx.branch_id}] improve text: {ctx.current_state.get('text')}"
+
+step_fn = build_json_model_step(adapter=adapter, prompt_fn=prompt_fn)
+engine = LoopEngine(step_fn=step_fn, policy=policy, max_steps=5)
+result = engine.run(goal="policy-aware loop", initial_state={"text": "start"})
+print(result.best.score, result.best.recorder.run.run_id)
+```
+
+## MCP integration
+
+A built-in MCP server exposes loop artifacts as tools for editor/agent automation:
+
+- `list_run_artifacts`
+- `show_run_tool`
+- `diff_run_artifacts`
+- `fork_run_artifact`
+
+Start it with:
+
+```bash
+loopforge-mcp --runs-dir ~/.local/share/loopforge
+```
 

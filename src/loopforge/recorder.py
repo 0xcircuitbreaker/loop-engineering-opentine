@@ -18,6 +18,8 @@ import os
 
 from opentine import Run, StepKind, RunStatus
 
+from .policy import LoopPolicy
+
 
 @dataclass
 class RecordedStep:
@@ -35,6 +37,7 @@ class LoopRecorder:
 
     goal: str
     context: str = ""
+    policy: LoopPolicy | None = None
     run: Run = field(init=False)
     path: Path | None = None
     _last_step_id: str | None = None
@@ -54,7 +57,12 @@ class LoopRecorder:
             },
             status=RunStatus.running,
             user_prompt=safe_goal,
+            policies={"loop": (self.policy.to_dict() if self.policy else {})},
         )
+
+    def apply_policy(self, policy: LoopPolicy) -> None:
+        self.policy = policy
+        self.run.policies["loop"] = policy.to_dict()
 
     def record(self, step: RecordedStep) -> str:
         """Record one step and return its step id."""
@@ -78,8 +86,15 @@ class LoopRecorder:
             )
         )
 
-    def record_model(self, payload: dict[str, Any], *, outputs: dict[str, Any], parent_id: str | None = None,
-                     duration: float = 0.0, cost: float = 0.0) -> str:
+    def record_model(
+        self,
+        payload: dict[str, Any],
+        *,
+        outputs: dict[str, Any],
+        parent_id: str | None = None,
+        duration: float = 0.0,
+        cost: float = 0.0,
+    ) -> str:
         return self.record(
             RecordedStep(
                 kind=StepKind.model,
@@ -119,13 +134,19 @@ class LoopRecorder:
         The returned loop recorder shares provenance for all ancestors but has
         its own tip and can continue independently.
         """
-        forked = LoopRecorder(goal=self.goal, context=self.context)
+        forked = LoopRecorder(
+            goal=self.run.manifest.get("goal", ""),
+            context=(self.run.manifest.get("context", "") or ""),
+            policy=self.policy,
+        )
         forked.run = self.run.fork(
             from_step_id=from_step_id,
             new_run_id=f"{self.run.run_id[:10]}-{branch_id}-{uuid4().hex[:6]}",
             branch=branch_id,
         )
         forked._last_step_id = from_step_id
+        # preserve loop-specific policy metadata on forked child
+        forked.run.policies["loop"] = (self.policy.to_dict() if self.policy else {})
         return forked
 
     def save(self, path: str | Path | None = None) -> Path:

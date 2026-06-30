@@ -14,7 +14,9 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+import time
 
+from .policy import LoopPolicy
 from .recorder import LoopRecorder
 
 
@@ -26,6 +28,8 @@ class LoopStepContext:
     best_score: float | None
     history_len: int
     run_id: str
+    elapsed_seconds: float
+    accumulated_cost: float
 
 
 @dataclass
@@ -53,6 +57,7 @@ class LoopBranch:
     last_step_id: str | None = None
     score: float = 0.0
     steps: int = 0
+    cost: float = 0.0
     best_state: dict[str, Any] | None = None
 
 
@@ -91,6 +96,7 @@ class LoopEngine:
         target_score: float = float("inf"),
         autosave_steps: int = 0,
         runs_dir: str = "~/.local/share/loopforge",
+        policy: LoopPolicy | None = None,
     ) -> None:
         if max_branches < 1:
             raise ValueError("max_branches must be >= 1")
@@ -107,12 +113,49 @@ class LoopEngine:
         self.autosave_steps = autosave_steps
         self.runs_dir = Path(runs_dir).expanduser()
         self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self.policy = policy or LoopPolicy()
 
-    def run(self, *, goal: str, initial_state: dict[str, Any], context: str = "") -> LoopExecutionResult:
+        # Local policy defaults stay explicit and stable for backwards compatibility
+        if self.policy.max_steps is None:
+            self.policy = LoopPolicy(
+                max_steps=max_steps,
+                max_total_cost=self.policy.max_total_cost,
+                max_duration_seconds=self.policy.max_duration_seconds,
+                min_score=self.policy.min_score,
+            )
+
+    def _is_budget_breached(self, branch: LoopBranch, elapsed_seconds: float, step: LoopStepResult) -> str | None:
+        if self.policy.max_total_cost is not None and (branch.cost + step.cost) > self.policy.max_total_cost:
+            return f"budget exceeded: cost {branch.cost + step.cost:.6f} > {self.policy.max_total_cost}"
+        if self.policy.max_steps is not None and branch.steps + 1 > self.policy.max_steps:
+            return f"budget exceeded: steps {branch.steps + 1} > {self.policy.max_steps}"
+        if self.policy.max_duration_seconds is not None and elapsed_seconds > self.policy.max_duration_seconds:
+            return (
+                f"budget exceeded: elapsed_seconds {elapsed_seconds:.3f} > "
+                f"{self.policy.max_duration_seconds}"
+            )
+        if self.policy.min_score is not None and step.score >= self.policy.min_score:
+            # stop condition handled as a signal rather than hard error in loop body
+            return None
+        return None
+
+    def run(
+        self,
+        *,
+        goal: str,
+        initial_state: dict[str, Any],
+        context: str = "",
+        policy: LoopPolicy | None = None,
+    ) -> LoopExecutionResult:
+        run_policy = policy or self.policy
         root = LoopBranch(
             branch_id="root",
             state=initial_state,
-            recorder=LoopRecorder(goal=goal, context=context),
+            recorder=LoopRecorder(
+                goal=goal,
+                context=context,
+                policy=run_policy,
+            ),
             score=float("-inf"),
             best_state=dict(initial_state),
         )
@@ -123,11 +166,17 @@ class LoopEngine:
         best: LoopBranch | None = None
         best_step_result: LoopStepResult | None = None
         total_steps = 0
+        start_wall = time.perf_counter()
 
         branch_factory = LoopFactory(root.recorder.run.run_id)
 
-        while queue and total_steps < self.max_steps:
+        # Embed effective policy in run metadata.
+        root.recorder.apply_policy(run_policy)
+
+        effective_max_steps = run_policy.max_steps or self.max_steps
+        while queue and total_steps < effective_max_steps:
             branch = queue.popleft()
+            elapsed_seconds = time.perf_counter() - start_wall
             ctx = LoopStepContext(
                 iteration=branch.steps + 1,
                 branch_id=branch.branch_id,
@@ -135,6 +184,8 @@ class LoopEngine:
                 best_score=best.score if best else None,
                 history_len=branch.steps,
                 run_id=branch.recorder.run.run_id,
+                elapsed_seconds=elapsed_seconds,
+                accumulated_cost=branch.cost,
             )
 
             try:
@@ -158,6 +209,7 @@ class LoopEngine:
                     "next_count": len(step.next_states),
                     "stop": step.stop,
                     "model_outputs": step.model_outputs or {},
+                    "policy": run_policy.to_dict(),
                 },
                 parent_id=branch.last_step_id,
                 duration=step.duration,
@@ -165,12 +217,39 @@ class LoopEngine:
             )
             branch.last_step_id = step_id
             branch.steps += 1
+            branch.cost += step.cost
             total_steps += 1
             branch.score = step.score
 
             if step.score > (best.score if best else float("-inf")):
                 best = branch
                 best_step_result = step
+
+            # policy gates after accounting for this step
+            reason = self._is_budget_breached(branch, elapsed_seconds, step)
+            if reason is not None:
+                branch.recorder.record_think(
+                    {
+                        "event": "policy_gate",
+                        "branch_id": branch.branch_id,
+                        "reason": reason,
+                        "elapsed_seconds": elapsed_seconds,
+                        "accumulated_cost": branch.cost,
+                    },
+                    parent_id=branch.last_step_id,
+                )
+                branch.recorder.record_done(
+                    summary=reason,
+                    parent_id=branch.last_step_id,
+                )
+                continue
+
+            if run_policy.min_score is not None and step.score >= run_policy.min_score:
+                branch.recorder.record_done(
+                    summary=f"Reached min_score goal at {step.score}",
+                    parent_id=branch.last_step_id,
+                )
+                continue
 
             if step.stop or step.score >= self.target_score:
                 branch.recorder.record_done(
@@ -199,10 +278,22 @@ class LoopEngine:
             for idx, cand in enumerate(candidates):
                 if "state" not in cand:
                     continue
+
+                candidate_score = float(cand.get("score", step.score))
+
                 if not primary_applied:
                     branch.state = dict(cand["state"])
                     if "best" in cand:
                         branch.best_state = dict(cand["state"])
+                    branch.recorder.record_think(
+                        {
+                            "event": "branch_continue",
+                            "candidate_index": idx,
+                            "candidate_score": candidate_score,
+                            "origin_step": branch.last_step_id,
+                        },
+                        parent_id=branch.last_step_id,
+                    )
                     queue.append(branch)
                     primary_applied = True
                     continue
@@ -212,12 +303,15 @@ class LoopEngine:
                     from_step_id=branch.last_step_id,
                     branch_id=branch_factory.branch_id("fork"),
                 )
+                forked_recorder.apply_policy(run_policy)
+
                 forked_branch = LoopBranch(
                     branch_id=branch_factory.branch_id("alt"),
                     state=dict(cand["state"]),
                     recorder=forked_recorder,
                     last_step_id=branch.last_step_id,
-                    score=float(cand.get("score", step.score)),
+                    score=candidate_score,
+                    cost=branch.cost,
                     best_state=dict(cand["state"]),
                 )
                 forked_branch.recorder.record_think(
@@ -226,7 +320,7 @@ class LoopEngine:
                         "parent_branch": branch.branch_id,
                         "origin_step": branch.last_step_id,
                         "candidate_index": idx,
-                        "candidate_score": cand.get("score", step.score),
+                        "candidate_score": candidate_score,
                     },
                     parent_id=forked_branch.last_step_id,
                 )
